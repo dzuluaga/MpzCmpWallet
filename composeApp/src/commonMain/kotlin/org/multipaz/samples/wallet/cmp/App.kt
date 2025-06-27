@@ -36,6 +36,8 @@ import org.jetbrains.compose.resources.painterResource
 import org.multipaz.asn1.ASN1Integer
 import org.multipaz.cbor.Simple
 import org.multipaz.compose.permissions.rememberBluetoothPermissionState
+import org.multipaz.compose.presentment.MdocProximityQrPresentment
+import org.multipaz.compose.presentment.MdocProximityQrSettings
 import org.multipaz.compose.presentment.Presentment
 import org.multipaz.compose.prompt.PromptDialogs
 import org.multipaz.compose.qrcode.generateQrCode
@@ -69,6 +71,7 @@ import org.multipaz.storage.Storage
 import org.multipaz.trustmanagement.TrustManager
 import org.multipaz.trustmanagement.TrustPoint
 import org.multipaz.util.Platform
+import org.multipaz.util.Platform.promptModel
 import org.multipaz.util.UUID
 import org.multipaz.util.fromHex
 import org.multipaz.util.toBase64Url
@@ -107,6 +110,7 @@ class App() {
             documentTypeRepository = DocumentTypeRepository().apply {
                 addDocumentType(DrivingLicense.getDocumentType())
             }
+
             documentStore = buildDocumentStore(storage = storage, secureAreaRepository = secureAreaRepository) {}
             if (documentStore.listDocuments().isEmpty()) {
                 val now = Clock.System.now()
@@ -248,127 +252,118 @@ class App() {
                     }
                 }
             } else {
-                val deviceEngagement = remember { mutableStateOf<ByteString?>(null) }
-                val state = presentmentModel.state.collectAsState()
-                when (state.value) {
-                    PresentmentModel.State.IDLE -> {
-                        showQrButton(deviceEngagement)
+                // MdocProximityQrPresentment handles the complete QR code presentation flow
+                // It manages state transitions between showing the button and displaying the QR code
+                MdocProximityQrPresentment(
+                    modifier = Modifier,
+                    appName = appName,
+                    appIconPainter = painterResource(appIcon),
+                    presentmentModel = presentmentModel,
+                    presentmentSource = presentmentSource,
+                    promptModel = promptModel,
+                    documentTypeRepository = documentTypeRepository,
+                    
+                    // showQrButton: Component calls this lambda to render the "Present mDL" button
+                    // When user clicks the button, call onQrButtonClicked with connection settings
+                    showQrButton = { onQrButtonClicked ->
+                        showQrButtonContent(onQrButtonClicked)
+                    },
+                    
+                    // showQrCode: Component calls this lambda when QR code is ready to display
+                    // The 'uri' parameter contains the mdoc:// URL that should be encoded in the QR code
+                    showQrCode = { uri ->
+                        showQrCodeContent(uri)
                     }
-
-                    PresentmentModel.State.CONNECTING -> {
-                        showQrCode(deviceEngagement)
-                    }
-
-                    PresentmentModel.State.WAITING_FOR_SOURCE,
-                    PresentmentModel.State.PROCESSING,
-                    PresentmentModel.State.WAITING_FOR_DOCUMENT_SELECTION,
-                    PresentmentModel.State.WAITING_FOR_CONSENT,
-                    PresentmentModel.State.COMPLETED -> {
-                        Presentment(
-                            appName = appName,
-                            appIconPainter = painterResource(appIcon),
-                            presentmentModel = presentmentModel,
-                            presentmentSource = presentmentSource,
-                            documentTypeRepository = documentTypeRepository,
-                            onPresentmentComplete = {
-                                presentmentModel.reset()
-                            },
-                        )
-                    }
-                }
+                )
             }
         }
     }
 
+    /**
+     * Renders the "Present mDL via QR" button UI.
+     * 
+     * This demonstrates how to:
+     * 1. Create a button that triggers QR code presentation
+     * 2. Configure BLE connection methods for mdoc transport
+     * 3. Use the callback pattern to communicate with MdocProximityQrPresentment
+     * 
+     * @param onQrButtonClicked Callback provided by MdocProximityQrPresentment.
+     *                          Call this with your desired connection settings to start QR code generation.
+     */
     @Composable
-    private fun showQrButton(showQrCode: MutableState<ByteString?>) {
+    private fun showQrButtonContent(onQrButtonClicked: (MdocProximityQrSettings) -> Unit) {
         Column(
             modifier = Modifier.fillMaxSize(),
             verticalArrangement = Arrangement.Center,
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             Button(onClick = {
-                presentmentModel.reset()
-                presentmentModel.setConnecting()
-                presentmentModel.presentmentScope.launch() {
-                    val connectionMethods = listOf(
-                        MdocConnectionMethodBle(
-                            supportsPeripheralServerMode = false,
-                            supportsCentralClientMode = true,
-                            peripheralServerModeUuid = null,
-                            centralClientModeUuid = UUID.randomUUID(),
-                        )
+                // When user clicks the button, tell MdocProximityQrPresentment to start
+                // QR code generation with these connection settings
+                onQrButtonClicked(
+                    MdocProximityQrSettings(
+                        // Configure BLE connection methods for mdoc transport
+                        availableConnectionMethods = listOf(
+                            MdocConnectionMethodBle(
+                                // This device will act as BLE central (client)
+                                supportsPeripheralServerMode = false,
+                                supportsCentralClientMode = true,
+                                peripheralServerModeUuid = null,
+                                // Generate a random UUID for this presentation session
+                                centralClientModeUuid = UUID.randomUUID(),
+                            )
+                        ),
+                        // Use BLE L2CAP for better performance (if supported)
+                        createTransportOptions = MdocTransportOptions(bleUseL2CAP = true)
                     )
-                    val eDeviceKey = Crypto.createEcPrivateKey(EcCurve.P256)
-                    val advertisedTransports = connectionMethods.advertise(
-                        role = MdocRole.MDOC,
-                        transportFactory = MdocTransportFactory.Default,
-                        options = MdocTransportOptions(bleUseL2CAP = true),
-                    )
-                    val engagementGenerator = EngagementGenerator(
-                        eSenderKey = eDeviceKey.publicKey,
-                        version = "1.0"
-                    )
-                    engagementGenerator.addConnectionMethods(advertisedTransports.map {
-                        it.connectionMethod
-                    })
-                    val encodedDeviceEngagement = ByteString(engagementGenerator.generate())
-                    showQrCode.value = encodedDeviceEngagement
-                    val transport = advertisedTransports.waitForConnection(
-                        eSenderKey = eDeviceKey.publicKey,
-                        coroutineScope = presentmentModel.presentmentScope
-                    )
-                    presentmentModel.setMechanism(
-                        MdocPresentmentMechanism(
-                            transport = transport,
-                            eDeviceKey = eDeviceKey,
-                            encodedDeviceEngagement = encodedDeviceEngagement,
-                            handover = Simple.NULL,
-                            engagementDuration = null,
-                            allowMultipleRequests = false
-                        )
-                    )
-                    showQrCode.value = null
-                }
+                )
             }) {
                 Text("Present mDL via QR")
             }
-            Spacer(modifier = Modifier.height(16.dp))
-            Text(
-                text = "The mDL is also available\n" +
-                        "via NFC engagement and W3C DC API\n" +
-                        "(Android-only right now)",
-                textAlign = TextAlign.Center)
         }
     }
 
+    /**
+     * Displays the generated QR code for mdoc presentation.
+     * 
+     * This demonstrates how to:
+     * 1. Receive the mdoc:// URI from MdocProximityQrPresentment
+     * 2. Generate a QR code bitmap from the URI
+     * 3. Display the QR code with appropriate UI elements
+     * 4. Provide a way to cancel the presentation
+     * 
+     * @param uri The mdoc:// URI containing the device engagement data.
+     *            This URI should be encoded in the QR code for readers to scan.
+     */
     @Composable
-    private fun showQrCode(deviceEngagement: MutableState<ByteString?>) {
+    private fun showQrCodeContent(uri: String) {
+        // Generate QR code bitmap from the mdoc:// URI
+        // The remember ensures we don't regenerate on every recomposition
+        val qrCodeBitmap = remember { generateQrCode(uri) }
+        
         Column(
             modifier = Modifier.fillMaxSize().padding(16.dp),
             verticalArrangement = Arrangement.Center,
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            if (deviceEngagement.value != null) {
-                val mdocUrl = "mdoc:" + deviceEngagement.value!!.toByteArray().toBase64Url()
-                val qrCodeBitmap = remember { generateQrCode(mdocUrl) }
-                Text(text = "Present QR code to mdoc reader")
-                Image(
-                    modifier = Modifier.fillMaxWidth(),
-                    bitmap = qrCodeBitmap,
-                    contentDescription = null,
-                    contentScale = ContentScale.FillWidth
-                )
-                Button(
-                    onClick = {
-                        presentmentModel.reset()
-                    }
-                ) {
-                    Text("Cancel")
-                }
+            Text(text = "Present QR code to mdoc reader")
+            
+            // Display the QR code image
+            Image(
+                modifier = Modifier.fillMaxWidth(),
+                bitmap = qrCodeBitmap,
+                contentDescription = null,
+                contentScale = ContentScale.FillWidth
+            )
+            
+            // Allow user to cancel the presentation and return to the button screen
+            Button(onClick = { presentmentModel.reset() }) {
+                Text("Cancel")
             }
         }
     }
+
+
 
     companion object {
         val promptModel = Platform.promptModel

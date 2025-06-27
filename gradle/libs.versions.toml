@@ -17,7 +17,7 @@ kotlinx-coroutines = "1.8.1"
 kotlinx-io = "0.4.0"
 kotlinx-datetime = "0.6.0"
 kotlinx-serialization = "1.7.3"
-multipaz = "0.92.0"
+multipaz = "0.92.0-pre.31.b73cc592"
 
 [libraries]
 kotlin-test = { module = "org.jetbrains.kotlin:kotlin-test", version.ref = "kotlin" }
